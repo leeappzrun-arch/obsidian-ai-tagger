@@ -12,6 +12,11 @@ import {
 type AiProvider = "ollama" | "openai-compatible";
 type TagFormat = "keep" | "lower-kebab" | "uc-first" | "camel" | "pascal" | "snake";
 
+interface TagSearchLinkCandidate {
+	text: string;
+	tag: string;
+}
+
 interface AiTaggerSettings {
 	provider: AiProvider;
 	endpointUrl: string;
@@ -19,6 +24,7 @@ interface AiTaggerSettings {
 	model: string;
 	autoGenerate: boolean;
 	autoDebounceSeconds: number;
+	tagSearchLinks: boolean;
 	tagFormat: TagFormat;
 	maxTags: number;
 	generatedTagsProperty: string;
@@ -31,6 +37,7 @@ const DEFAULT_SETTINGS: AiTaggerSettings = {
 	model: "",
 	autoGenerate: false,
 	autoDebounceSeconds: 8,
+	tagSearchLinks: false,
 	tagFormat: "lower-kebab",
 	maxTags: 8,
 	generatedTagsProperty: "aiGeneratedTags",
@@ -187,7 +194,17 @@ export default class AiTaggerPlugin extends Plugin {
 			}
 
 			const finalGeneratedTags = this.prepareTags(generated, existingTags);
+			this.recentlyUpdated.set(file.path, Date.now());
 			await this.writeGeneratedTags(file, finalGeneratedTags);
+			if (this.settings.tagSearchLinks) {
+				const tagSearchLinks = await this.requestTagSearchLinks(file, note, [
+					...existingTags,
+					...finalGeneratedTags,
+				]);
+				await this.writeTagSearchLinks(file, tagSearchLinks, [...existingTags, ...finalGeneratedTags]);
+			}
+			const updatedNote = await this.app.vault.cachedRead(file);
+			this.contentHashes.set(file.path, await hashText(updatedNote));
 			this.recentlyUpdated.set(file.path, Date.now());
 
 			if (!quiet) {
@@ -281,6 +298,69 @@ export default class AiTaggerPlugin extends Plugin {
 		return extractTags(content);
 	}
 
+	private async requestTagSearchLinks(
+		file: TFile,
+		note: string,
+		availableTags: string[]
+	): Promise<TagSearchLinkCandidate[]> {
+		const tags = uniqueTags(availableTags).slice(0, 300);
+		if (!tags.length) {
+			return [];
+		}
+
+		const prompt = this.buildTagSearchLinksPrompt(file, note, tags);
+		const provider = this.settings.provider;
+
+		if (provider === "ollama") {
+			const response = await requestUrl({
+				url: makeOllamaGenerateUrl(this.settings.endpointUrl),
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					...(this.settings.apiKey ? { Authorization: `Bearer ${this.settings.apiKey}` } : {}),
+				},
+				body: JSON.stringify({
+					model: this.settings.model,
+					prompt,
+					stream: false,
+					format: "json",
+					options: {
+						temperature: 0.1,
+					},
+				}),
+			});
+			const content = response.json?.response ?? response.text;
+			return extractTagSearchLinks(content, tags);
+		}
+
+		const response = await requestUrl({
+			url: makeChatCompletionsUrl(this.settings.endpointUrl),
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				...(this.settings.apiKey ? { Authorization: `Bearer ${this.settings.apiKey}` } : {}),
+			},
+			body: JSON.stringify({
+				model: this.settings.model,
+				temperature: 0.1,
+				messages: [
+					{
+						role: "system",
+						content:
+							"You add conservative Obsidian tag-search links. Return only valid JSON with a links array.",
+					},
+					{
+						role: "user",
+						content: prompt,
+					},
+				],
+			}),
+		});
+
+		const content = response.json?.choices?.[0]?.message?.content ?? response.text;
+		return extractTagSearchLinks(content, tags);
+	}
+
 	private buildPrompt(file: TFile, note: string, existingTags: string[]): string {
 		const clippedNote = stripFrontmatter(note).slice(0, 12000);
 		const existingTagText = existingTags.slice(0, 250).join(", ");
@@ -297,6 +377,30 @@ export default class AiTaggerPlugin extends Plugin {
 			"",
 			"Existing vault tags:",
 			existingTagText || "(none)",
+			"",
+			"Note content:",
+			clippedNote,
+		].join("\n");
+	}
+
+	private buildTagSearchLinksPrompt(file: TFile, note: string, availableTags: string[]): string {
+		const clippedNote = stripFrontmatter(note).slice(0, 12000);
+		const tagText = availableTags.join(", ");
+
+		return [
+			`Note title: ${file.basename}`,
+			"",
+			"Task: find words or short phrases in the note that should link to an Obsidian tag search.",
+			"Each link must use one of the available tags exactly as written.",
+			'The "text" value must be exact visible text copied from the note body.',
+			"Choose text that is semantically related to the tag, not just text that shares a few letters.",
+			"Do not choose text from YAML frontmatter, existing markdown links, wikilinks, code blocks, inline code, or literal #tags.",
+			"If a selected word or phrase appears multiple times in normal note text, include it once; the plugin will link every safe instance.",
+			"Avoid linking headings unless there is no better body text.",
+			'Return JSON only, exactly like: {"links":[{"text":"home lab","tag":"homelab"}]}',
+			"",
+			"Available tags:",
+			tagText,
 			"",
 			"Note content:",
 			clippedNote,
@@ -369,6 +473,39 @@ export default class AiTaggerPlugin extends Plugin {
 			frontmatter.tags = merged;
 			frontmatter[property] = generatedTags;
 		});
+	}
+
+	private async writeTagSearchLinks(
+		file: TFile,
+		candidates: TagSearchLinkCandidate[],
+		availableTags: string[]
+	) {
+		const tagByCanonical = new Map<string, string>();
+		for (const tag of availableTags) {
+			const cleaned = cleanTag(tag);
+			if (cleaned) {
+				tagByCanonical.set(canonicalTag(cleaned), cleaned);
+			}
+		}
+
+		const validCandidates = candidates
+			.map((candidate) => ({
+				text: candidate.text.trim(),
+				tag: tagByCanonical.get(canonicalTag(candidate.tag)),
+			}))
+			.filter((candidate): candidate is { text: string; tag: string } =>
+				Boolean(candidate.text && candidate.tag)
+			);
+
+		if (!validCandidates.length) {
+			return;
+		}
+
+		const current = await this.app.vault.read(file);
+		const updated = applyTagSearchLinks(current, validCandidates);
+		if (updated !== current) {
+			await this.app.vault.modify(file, updated);
+		}
 	}
 }
 
@@ -476,6 +613,16 @@ class AiTaggerSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						}
 					})
+			);
+
+		new Setting(containerEl)
+			.setName("Tag search links (experimental)")
+			.setDesc("Experimentally link related words in the note to Obsidian tag searches when tags are generated.")
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.tagSearchLinks).onChange(async (value) => {
+					this.plugin.settings.tagSearchLinks = value;
+					await this.plugin.saveSettings();
+				})
 			);
 
 		new Setting(containerEl)
@@ -589,6 +736,59 @@ function extractTags(content: unknown): string[] {
 		.filter(Boolean);
 }
 
+function extractTagSearchLinks(content: unknown, availableTags: string[]): TagSearchLinkCandidate[] {
+	const tagByCanonical = new Map<string, string>();
+	for (const tag of availableTags) {
+		const cleaned = cleanTag(tag);
+		if (cleaned) {
+			tagByCanonical.set(canonicalTag(cleaned), cleaned);
+		}
+	}
+
+	const parsed = parseJsonLike(content);
+	const rawLinks = Array.isArray(parsed)
+		? parsed
+		: Array.isArray(parsed?.links)
+			? parsed.links
+			: [];
+	const links: TagSearchLinkCandidate[] = [];
+	const seen = new Set<string>();
+
+	for (const rawLink of rawLinks) {
+		if (!rawLink || typeof rawLink !== "object") {
+			continue;
+		}
+
+		const text = typeof rawLink.text === "string" ? rawLink.text.trim() : "";
+		const requestedTag = typeof rawLink.tag === "string" ? rawLink.tag : "";
+		const tag = tagByCanonical.get(canonicalTag(requestedTag));
+		const key = `${text.toLowerCase()}\u0000${canonicalTag(tag ?? "")}`;
+
+		if (text && tag && !seen.has(key)) {
+			links.push({ text, tag });
+			seen.add(key);
+		}
+		if (links.length >= 20) {
+			break;
+		}
+	}
+
+	return links;
+}
+
+function parseJsonLike(content: unknown): any {
+	if (typeof content !== "string") {
+		return content;
+	}
+
+	try {
+		return JSON.parse(extractJsonText(content));
+	} catch (error) {
+		console.warn("AI Tagger could not parse tag-search link JSON response", error, content);
+		return null;
+	}
+}
+
 function extractJsonText(content: string): string {
 	const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
 	if (fenced) {
@@ -621,6 +821,157 @@ function stripFrontmatter(note: string): string {
 	return note.slice(end + 4).trimStart();
 }
 
+function applyTagSearchLinks(note: string, candidates: TagSearchLinkCandidate[]): string {
+	const { prefix, body } = splitFrontmatter(note);
+	let linkedBody = body;
+	const usedCandidates = new Set<string>();
+
+	for (const candidate of candidates) {
+		const candidateKey = `${candidate.text.toLowerCase()}\u0000${canonicalTag(candidate.tag)}`;
+		if (usedCandidates.has(candidateKey)) {
+			continue;
+		}
+
+		const result = linkAllPlainTextMatches(linkedBody, candidate.text, candidate.tag);
+		if (result.changed) {
+			linkedBody = result.text;
+			usedCandidates.add(candidateKey);
+		}
+	}
+
+	return prefix + linkedBody;
+}
+
+function splitFrontmatter(note: string): { prefix: string; body: string } {
+	if (!note.startsWith("---")) {
+		return { prefix: "", body: note };
+	}
+
+	const end = note.indexOf("\n---", 3);
+	if (end === -1) {
+		return { prefix: "", body: note };
+	}
+
+	let bodyStart = end + 4;
+	if (note.slice(bodyStart, bodyStart + 2) === "\r\n") {
+		bodyStart += 2;
+	} else if (note.charAt(bodyStart) === "\n") {
+		bodyStart += 1;
+	}
+
+	return {
+		prefix: note.slice(0, bodyStart),
+		body: note.slice(bodyStart),
+	};
+}
+
+function linkAllPlainTextMatches(
+	body: string,
+	phrase: string,
+	tag: string
+): { text: string; changed: boolean } {
+	const normalizedPhrase = phrase.replace(/\s+/g, " ").trim();
+	if (!normalizedPhrase) {
+		return { text: body, changed: false };
+	}
+
+	const protectedRanges = getProtectedMarkdownRanges(body);
+	const pattern = new RegExp(escapeRegExp(normalizedPhrase).replace(/\s+/g, "\\s+"), "i");
+	let searchFrom = 0;
+	let linkedBody = body;
+	let offset = 0;
+	let changed = false;
+
+	while (searchFrom < body.length) {
+		const match = pattern.exec(body.slice(searchFrom));
+		if (!match || match.index === undefined) {
+			break;
+		}
+
+		const start = searchFrom + match.index;
+		const end = start + match[0].length;
+		if (isPlainTextLinkTarget(body, start, end, protectedRanges)) {
+			const visibleText = escapeMarkdownLinkText(body.slice(start, end));
+			const linked = `[${visibleText}](obsidian://search?query=tag:${encodeURIComponent(tag)})`;
+			const linkedStart = start + offset;
+			const linkedEnd = end + offset;
+			linkedBody = linkedBody.slice(0, linkedStart) + linked + linkedBody.slice(linkedEnd);
+			offset += linked.length - (end - start);
+			changed = true;
+		}
+
+		searchFrom = end || searchFrom + 1;
+	}
+
+	return { text: linkedBody, changed };
+}
+
+function getProtectedMarkdownRanges(markdown: string): Array<[number, number]> {
+	const ranges: Array<[number, number]> = [];
+	const patterns = [
+		/```[\s\S]*?(?:```|$)/g,
+		/~~~[\s\S]*?(?:~~~|$)/g,
+		/`[^`\n]+`/g,
+		/!?\[[^\]\n]*\]\([^)\n]*\)/g,
+		/\[\[[\s\S]*?\]\]/g,
+		/https?:\/\/[^\s)]+/g,
+		/(^|\s)#[A-Za-z0-9/_-]+/g,
+	];
+
+	for (const pattern of patterns) {
+		let match: RegExpExecArray | null;
+		while ((match = pattern.exec(markdown)) !== null) {
+			const start = match[0].startsWith(" ") || match[0].startsWith("\n")
+				? match.index + 1
+				: match.index;
+			ranges.push([start, match.index + match[0].length]);
+		}
+	}
+
+	return mergeRanges(ranges);
+}
+
+function isPlainTextLinkTarget(
+	markdown: string,
+	start: number,
+	end: number,
+	protectedRanges: Array<[number, number]>
+): boolean {
+	if (protectedRanges.some(([rangeStart, rangeEnd]) => start < rangeEnd && end > rangeStart)) {
+		return false;
+	}
+
+	const previous = start > 0 ? markdown.charAt(start - 1) : "";
+	const next = end < markdown.length ? markdown.charAt(end) : "";
+	if (previous === "#" || /[A-Za-z0-9_-]/.test(previous) || /[A-Za-z0-9_-]/.test(next)) {
+		return false;
+	}
+
+	return true;
+}
+
+function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
+	return ranges
+		.sort((a, b) => a[0] - b[0])
+		.reduce<Array<[number, number]>>((merged, range) => {
+			const previous = merged[merged.length - 1];
+			if (!previous || range[0] > previous[1]) {
+				merged.push([...range]);
+			} else {
+				previous[1] = Math.max(previous[1], range[1]);
+			}
+			return merged;
+		}, []);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeMarkdownLinkText(value: string): string {
+	return value.replace(/\\/g, "\\\\").replace(/]/g, "\\]");
+}
+
 function cleanTag(tag: string): string {
 	return tag
 		.trim()
@@ -634,6 +985,22 @@ function cleanTag(tag: string): string {
 
 function canonicalTag(tag: string): string {
 	return cleanTag(tag).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function uniqueTags(tags: string[]): string[] {
+	const unique: string[] = [];
+	const seen = new Set<string>();
+
+	for (const tag of tags) {
+		const cleaned = cleanTag(tag);
+		const key = canonicalTag(cleaned);
+		if (cleaned && !seen.has(key)) {
+			unique.push(cleaned);
+			seen.add(key);
+		}
+	}
+
+	return unique;
 }
 
 function formatTag(tag: string, format: TagFormat): string {
