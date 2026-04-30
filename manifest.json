@@ -1,7 +1,7 @@
 {
 	"id": "obsidian-ai-tagger",
 	"name": "AI Tagger",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "1.5.0",
 	"description": "Generate and maintain note tags with an AI endpoint such as Ollama or an OpenAI-compatible API.",
 	"author": "Lee Caine",
