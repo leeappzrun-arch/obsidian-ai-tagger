@@ -1,0 +1,66 @@
+name: Build plugin
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Package plugin zip
+        run: |
+          mkdir -p dist/obsidian-ai-tagger
+          cp manifest.json main.js styles.css dist/obsidian-ai-tagger/
+          cd dist
+          zip -r obsidian-ai-tagger.zip obsidian-ai-tagger
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obsidian-ai-tagger
+          path: dist/obsidian-ai-tagger.zip
+
+      - name: Publish tag release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/obsidian-ai-tagger.zip \
+            manifest.json \
+            main.js \
+            styles.css \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+          || gh release upload "${GITHUB_REF_NAME}" \
+            dist/obsidian-ai-tagger.zip \
+            manifest.json \
+            main.js \
+            styles.css \
+            --clobber
